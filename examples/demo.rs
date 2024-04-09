@@ -1,4 +1,6 @@
-use futures::stream::StreamExt;
+use futures::{StreamExt, TryStreamExt};
+use libp2p::mdns::tokio::Tokio;
+use libp2p::swarm::NetworkBehaviour;
 use libp2p::{gossipsub, mdns, noise, swarm::SwarmEvent, tcp, yamux};
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
@@ -6,7 +8,12 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
-use yrs_libp2p::{YSyncBehaviour, Event};
+
+#[derive(NetworkBehaviour)]
+struct Demo {
+    gossipsub: libp2p::gossipsub::Behaviour,
+    mdns: libp2p::mdns::Behaviour<Tokio>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -46,7 +53,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-            Ok(YSyncBehaviour::new(gossipsub, mdns))
+            Ok(Demo { gossipsub, mdns })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -76,19 +83,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
             }
             event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(Event::Mdns(mdns::Event::Discovered(list))) => {
+                SwarmEvent::Behaviour(DemoEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, _multiaddr) in list {
                         println!("mDNS discovered a new peer: {peer_id}");
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
                 },
-                SwarmEvent::Behaviour(Event::Mdns(mdns::Event::Expired(list))) => {
-                    for (peer_id, _multiaddr) in list {
+                SwarmEvent::Behaviour(DemoEvent::Mdns(mdns::Event::Expired(list))) => {
+                    for (peer_id, multiaddr) in list {
                         println!("mDNS discover peer has expired: {peer_id}");
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                     }
                 },
-                SwarmEvent::Behaviour(Event::Gossipsub(gossipsub::Event::Message {
+                SwarmEvent::Behaviour(DemoEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source: peer_id,
                     message_id: id,
                     message,
