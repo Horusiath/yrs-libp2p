@@ -3969,6 +3969,7 @@ version = "0.1.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3523ab5a71916ccf420eebdf5521fcef02141234bbc0b8a49f2fdc4544364ef"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -4532,9 +4533,7 @@ dependencies = [
 
 [[package]]
 name = "yrs"
-version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd95835cc7973a5867b769d5373effbfe75138f0544c4ad7cca7bc5080ca1897"
+version = "0.18.2"
 dependencies = [
  "arc-swap",
  "atomic_refcell",
@@ -4550,11 +4549,14 @@ dependencies = [
 name = "yrs-libp2p"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "libp2p",
+ "smallvec",
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "tracing-subscriber",
  "yrs",
 ]

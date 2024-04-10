@@ -1,4 +1,4 @@
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use libp2p::mdns::tokio::Tokio;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{gossipsub, mdns, noise, swarm::SwarmEvent, tcp, yamux};
@@ -8,10 +8,14 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
+use yrs::sync::DefaultProtocol;
+use yrs::types::ToJson;
+use yrs::{Map, Transact};
+use yrs_libp2p::behaviour::Behaviour;
 
 #[derive(NetworkBehaviour)]
 struct Demo {
-    gossipsub: libp2p::gossipsub::Behaviour,
+    sync: Behaviour<DefaultProtocol>,
     mdns: libp2p::mdns::Behaviour<Tokio>,
 }
 
@@ -24,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
-            tcp::Config::default(),
+            tcp::Config::new(),
             noise::Config::new,
             yamux::Config::default,
         )?
@@ -37,77 +41,107 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 gossipsub::MessageId::from(s.finish().to_string())
             };
 
-            // Set a custom gossipsub configuration
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-                .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message signing)
-                .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
-                .build()
-                .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
-
-            // build a gossipsub network behaviour
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )?;
+            let sync = Behaviour::default();
 
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-            Ok(Demo { gossipsub, mdns })
+            Ok(Demo { sync, mdns })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
-
-    // Create a Gossipsub topic
-    let topic = gossipsub::IdentTopic::new("test-net");
-    // subscribes to our topic
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     // Read full lines from stdin
     let mut stdin = io::BufReader::new(io::stdin()).lines();
 
     // Listen on all interfaces and whatever port the OS assigns
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-    println!("Enter messages via STDIN and they will be sent to connected peers using Gossipsub");
+    println!("Enter command via STDIN");
 
     // Kick it off
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
-                if let Err(e) = swarm
-                    .behaviour_mut().gossipsub
-                    .publish(topic.clone(), line.as_bytes()) {
-                    println!("Publish error: {e:?}");
+                match Args::from_str(line.as_str()) {
+                    Some(args) => {
+                        let doc = swarm.behaviour_mut().sync.awareness_mut().doc();
+                        let map = doc.get_or_insert_map("map");
+                        let mut txn = doc.transact_mut();
+
+                        match args {
+                            Args::Set { key, value } => {
+                                map.insert(&mut txn, key, value);
+                            },
+                            Args::Remove { key } => {
+                                map.remove(&mut txn, key);
+                            }
+                        }
+                        println!("Document state (local change): {}", map.to_json(&txn))
+                    },
+                    None => {
+                        eprintln!("PARSE ERROR");
+                    }
                 }
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(DemoEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, _multiaddr) in list {
                         println!("mDNS discovered a new peer: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        swarm.behaviour_mut().sync.add_peer(peer_id);
                     }
                 },
                 SwarmEvent::Behaviour(DemoEvent::Mdns(mdns::Event::Expired(list))) => {
                     for (peer_id, multiaddr) in list {
                         println!("mDNS discover peer has expired: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        swarm.behaviour_mut().sync.remove_peer(peer_id);
                     }
                 },
-                SwarmEvent::Behaviour(DemoEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: peer_id,
-                    message_id: id,
-                    message,
-                })) => println!(
-                        "Got message: '{}' with id: {id} from peer: {peer_id}",
-                        String::from_utf8_lossy(&message.data),
-                    ),
+                SwarmEvent::Behaviour(DemoEvent::Sync(yrs_libp2p::behaviour::Event::Message {
+                    sender,
+                    message
+                })) => {
+                    let doc = swarm.behaviour().sync.awareness().doc();
+                    let map = doc.get_or_insert_map("map");
+                    println!("Document state (remote change): {}", map.to_json(&doc.transact()))
+                },
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("Local node is listening on {address}");
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+enum Args<'a> {
+    Set { key: &'a str, value: &'a str },
+    Remove { key: &'a str },
+}
+
+impl<'a> Args<'a> {
+    fn from_str(s: &'a str) -> Option<Self> {
+        if s.starts_with("SET") {
+            let mut splits = s.strip_prefix("SET")?.split('=');
+            if let Some(key) = splits.next() {
+                let key = key.strip_prefix(' ')?.strip_suffix(' ')?;
+                if let Some(value) = splits.next() {
+                    let value = value.strip_prefix(' ')?.strip_suffix(' ')?;
+                    Some(Args::Set { key, value })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else if s.starts_with("DEL") {
+            let s = s.strip_prefix("DEL")?.strip_prefix(' ')?.strip_suffix(' ');
+            if let Some(key) = s {
+                Some(Args::Remove { key })
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
 }
