@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 map.remove(&mut txn, key);
                             }
                         }
+                        println!("Document `{}` local state: {}", topic, map.to_json(&txn))
                     },
                     None => {
                         eprintln!("PARSE ERROR");

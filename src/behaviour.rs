@@ -129,6 +129,7 @@ impl Behaviour {
             return;
         }
 
+        tracing::trace!("established connection to {peer_id}");
         // We need to send our subscriptions to the newly-connected node.
         if self.target_peers.contains(&peer_id) {
             for (topic, handle) in self.subscribed_topics.iter() {
@@ -528,7 +529,7 @@ impl TopicHandler {
             let mailbox = mailbox.clone();
             doc.observe_update_v1(move |_, e| {
                 // check if update has any data
-                if e.update.len() > 2 {
+                if &e.update != &[0, 0] {
                     let _ = mailbox.send(InternalEvent::Update {
                         topic: topic.clone(),
                         update: e.update.clone(),
@@ -539,12 +540,14 @@ impl TopicHandler {
         };
         let awareness = Awareness::new(doc);
         let on_awareness_update = awareness.on_update(move |e| {
-            let _ = mailbox.send(InternalEvent::AwarenessUpdate {
-                topic: topic.clone(),
-                added: e.added().into(),
-                updated: e.updated().into(),
-                removed: e.removed().into(),
-            });
+            if !(e.updated().is_empty() && e.added().is_empty() && e.removed().is_empty()) {
+                let _ = mailbox.send(InternalEvent::AwarenessUpdate {
+                    topic: topic.clone(),
+                    added: e.added().into(),
+                    updated: e.updated().into(),
+                    removed: e.removed().into(),
+                });
+            }
         });
 
         TopicHandler {
