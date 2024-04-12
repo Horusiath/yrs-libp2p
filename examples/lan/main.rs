@@ -8,7 +8,7 @@ use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
 use yrs::types::ToJson;
 use yrs::{Map, Transact};
-use yrs_libp2p::behaviour::{Behaviour, Event, Topic};
+use yrs_libp2p::behaviour::{Behaviour, Config, Event, Topic};
 
 #[derive(NetworkBehaviour)]
 struct Demo {
@@ -31,8 +31,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )?
         .with_quic()
         .with_behaviour(|key| {
-            // build a gossipsub network behaviour
-            let sync = Behaviour::new();
+            // create YSync behaviour
+            let sync = Behaviour::with_config(Config {
+                doc_options: yrs::Options::default(),
+            });
 
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
@@ -49,15 +51,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let topic: Topic = "test-doc".into();
 
-    println!("Enter command via STDIN");
+    println!("Enter command via STDIN. Available commands:");
+    println!("  - set <key> <value>");
+    println!("  - del <key>");
 
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
-                /* Accepted commands:
-                    - `set {key} {value}`
-                    - `del {key}`
-                */
                 match Args::from_str(line.as_str()) {
                     Some(args) => {
                         let doc = swarm.behaviour_mut().sync.awareness(topic.clone()).doc();
@@ -120,8 +120,8 @@ enum Args<'a> {
 impl<'a> Args<'a> {
     fn from_str(s: &'a str) -> Option<Self> {
         let mut s = s.split(' ');
-        let cmd = s.next()?;
-        match cmd {
+        let cmd = s.next()?.to_ascii_lowercase();
+        match cmd.as_str() {
             "set" => {
                 let key = s.next()?;
                 let value = s.next()?;

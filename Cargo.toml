@@ -2,13 +2,20 @@
 name = "yrs-libp2p"
 version = "0.1.0"
 edition = "2021"
+description = "Yrs network adapter library to libp2p"
+license = "MIT"
+authors = ["Bartosz Sypytkowski <b.sypytkowski@gmail.com>"]
+keywords = ["crdt", "yrs", "libp2p", "network"]
+homepage = "https://github.com/Horusiath/yrs-libp2p"
+repository = "https://github.com/Horusiath/yrs-libp2p"
+readme = "./README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 yrs = { version = "0.18.3" }
-libp2p = { version = "0.53", features = ["full"] }
-tokio = { version = "1.36", features = ["full"] }
+libp2p = { version = "0.53", features = [] }
+tokio = { version = "1.36", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 futures = "0.3"
 thiserror = "1.0"
@@ -18,3 +25,5 @@ bytes = { version = "1.6", features = ["serde"] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libp2p = { version = "0.53", features = ["mdns", "yamux", "tcp", "noise", "tokio", "quic", "macros"] }
+tokio = { version = "1.36", features = ["sync", "macros", "rt-multi-thread", "io-std", "io-util"] }
