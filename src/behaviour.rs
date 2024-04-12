@@ -73,25 +73,28 @@ impl Behaviour {
     /// Add a node to the list of nodes to propagate messages to.
     #[inline]
     pub fn add_peer(&mut self, peer_id: PeerId) {
-        // Send our initial message
         if self.connected_peers.contains(&peer_id) {
-            for (topic, handle) in self.subscribed_topics.iter() {
-                let sv = handle.awareness.doc().transact().state_vector();
-                self.events.push_back(ToSwarm::NotifyHandler {
-                    peer_id,
-                    handler: NotifyHandler::Any,
-                    event: DocMessage {
-                        source: None,
-                        doc_name: topic.clone(),
-                        message: Message::Sync(SyncMessage::SyncStep1(sv)),
-                    },
-                });
-            }
+            self.welcome(peer_id);
         }
 
         if self.target_peers.insert(peer_id) {
             self.events.push_back(ToSwarm::Dial {
                 opts: DialOpts::peer_id(peer_id).build(),
+            });
+        }
+    }
+
+    fn welcome(&mut self, peer_id: PeerId) {
+        for (topic, handle) in self.subscribed_topics.iter() {
+            let sv = handle.awareness.doc().transact().state_vector();
+            self.events.push_back(ToSwarm::NotifyHandler {
+                peer_id,
+                handler: NotifyHandler::Any,
+                event: DocMessage {
+                    source: None,
+                    doc_name: topic.clone(),
+                    message: Message::Sync(SyncMessage::SyncStep1(sv)),
+                },
             });
         }
     }
@@ -116,37 +119,14 @@ impl Behaviour {
         }
     }
 
-    fn on_connection_established(
-        &mut self,
-        ConnectionEstablished {
-            peer_id,
-            other_established,
-            ..
-        }: ConnectionEstablished,
-    ) {
-        if other_established > 0 {
+    fn on_connection_established(&mut self, conn: ConnectionEstablished) {
+        if conn.other_established > 0 {
             // We only care about the first time a peer connects.
             return;
         }
 
-        tracing::trace!("established connection to {peer_id}");
-        // We need to send our subscriptions to the newly-connected node.
-        if self.target_peers.contains(&peer_id) {
-            for (topic, handle) in self.subscribed_topics.iter() {
-                let sv = handle.awareness.doc().transact().state_vector();
-                self.events.push_back(ToSwarm::NotifyHandler {
-                    peer_id,
-                    handler: NotifyHandler::Any,
-                    event: DocMessage {
-                        source: None,
-                        doc_name: topic.clone(),
-                        message: Message::Sync(SyncMessage::SyncStep1(sv)),
-                    },
-                });
-            }
-        }
-
-        self.connected_peers.insert(peer_id);
+        self.connected_peers.insert(conn.peer_id);
+        self.welcome(conn.peer_id);
     }
 
     fn on_connection_closed(
@@ -443,7 +423,6 @@ where
     fn upgrade_outbound(self, socket: TSocket, _: Self::Info) -> Self::Future {
         use tokio_util::compat::FuturesAsyncReadCompatExt;
         Box::pin(async move {
-            tracing::trace!("sending message {self:?}");
             let mut framed = Framed::new(socket.compat(), Codec::new(None));
             framed.send(self).await?;
             framed.close().await?;
@@ -505,7 +484,6 @@ impl Decoder for Codec {
                     doc_name: topic,
                     message,
                 };
-                tracing::trace!("received message {message:?}");
                 Ok(Some(message))
             }
             Ok(None) => Ok(None),
