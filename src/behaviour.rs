@@ -20,7 +20,7 @@ use tokio_util::codec::{Decoder, Framed, LengthDelimitedCodec};
 use yrs::block::ClientID;
 use yrs::encoding::read::{Cursor, Read};
 use yrs::encoding::write::Write;
-use yrs::sync::{Awareness, DefaultProtocol, Message, Protocol as _, SyncMessage};
+use yrs::sync::{Awareness, Message, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Doc, Options, ReadTxn, Subscription, Transact, Update};
@@ -60,13 +60,14 @@ impl Behaviour {
     fn handler(&mut self, topic: Topic) -> &mut TopicHandler {
         match self.subscribed_topics.entry(topic.clone()) {
             Entry::Vacant(e) => {
-                let mut options = Options::default();
+                let mut options = self.config.doc_options.clone();
                 options.guid = topic.clone();
                 let handler = e.insert(TopicHandler::new(options, self.update_sender.clone()));
 
                 let sv = handler.awareness.doc().transact().state_vector();
                 // this awareness might not yet exist locally, but other peers may already have some state in it
                 for &peer_id in self.connected_peers.iter() {
+                    tracing::trace!("new handler for `{topic}` init msg to `{peer_id}`: {sv:?}");
                     self.events.push_back(ToSwarm::NotifyHandler {
                         peer_id,
                         handler: NotifyHandler::Any,
@@ -105,6 +106,7 @@ impl Behaviour {
     fn welcome(&mut self, peer_id: PeerId) {
         for (topic, handle) in self.subscribed_topics.iter() {
             let sv = handle.awareness.doc().transact().state_vector();
+            tracing::trace!("new handler for `{topic}` init msg to `{peer_id}`: {sv:?}");
             self.events.push_back(ToSwarm::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::Any,
@@ -125,6 +127,7 @@ impl Behaviour {
 
     fn broadcast(&mut self, topic: Topic, msg: Message) {
         for &peer_id in self.connected_peers.iter() {
+            tracing::trace!("`{topic}` broadcasting to `{peer_id}`: {msg:?}");
             self.events.push_back(ToSwarm::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::Any,
@@ -178,23 +181,17 @@ impl Behaviour {
             return;
         }
 
-        self.events
-            .push_back(ToSwarm::GenerateEvent(Event::Message {
-                source: msg.source.clone(),
-                topic: msg.doc_name.clone(),
-                message: msg.message.clone(),
-            }));
-
         let handle = self.handler(msg.doc_name.clone());
-        match handle.handle(msg.message) {
+        match handle.handle(&msg.message, &sender) {
             Ok(None) => { /* do nothing */ }
             Ok(Some(reply)) => {
+                tracing::trace!("sending reply to `{sender}`: {reply:?}");
                 self.events.push_back(ToSwarm::NotifyHandler {
                     peer_id: sender,
                     handler: NotifyHandler::Any,
                     event: DocMessage {
                         source: None,
-                        doc_name: msg.doc_name,
+                        doc_name: msg.doc_name.clone(),
                         message: reply.into(),
                     },
                 });
@@ -203,6 +200,13 @@ impl Behaviour {
                 tracing::warn!("failed to handle message from {sender}: {e}")
             }
         }
+
+        self.events
+            .push_back(ToSwarm::GenerateEvent(Event::Message {
+                source: msg.source,
+                topic: msg.doc_name,
+                message: msg.message,
+            }));
     }
 }
 
@@ -403,6 +407,12 @@ pub enum Error {
     SyncError(#[from] yrs::sync::Error),
 }
 
+impl From<yrs::sync::awareness::Error> for Error {
+    fn from(e: yrs::sync::awareness::Error) -> Self {
+        Error::SyncError(yrs::sync::Error::AwarenessEncoding(e))
+    }
+}
+
 /// An RPC received by the floodsub system.
 #[derive(Debug, Clone)]
 pub struct DocMessage {
@@ -445,6 +455,7 @@ where
 /// Configuration options for the  protocol.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
+    /// Template used for options used to create new documents.
     pub doc_options: Options,
 }
 
@@ -495,6 +506,7 @@ impl Decoder for Codec {
                     doc_name: topic,
                     message,
                 };
+                tracing::trace!("received message: {message:?}");
                 Ok(Some(message))
             }
             Ok(None) => Ok(None),
@@ -517,8 +529,8 @@ impl TopicHandler {
             let topic = topic.clone();
             let mailbox = mailbox.clone();
             doc.observe_update_v1(move |_, e| {
-                // check if update has any data
-                if &e.update != &[0, 0] {
+                // we only propagate local non-empty updates
+                if has_data(&e.update) {
                     let _ = mailbox.send(InternalEvent::Update {
                         topic: topic.clone(),
                         update: e.update.clone(),
@@ -546,25 +558,42 @@ impl TopicHandler {
         }
     }
 
-    fn handle(&mut self, msg: Message) -> Result<Option<Message>, Error> {
-        let protocol = DefaultProtocol;
-        let awareness = &mut self.awareness;
+    fn handle(&mut self, msg: &Message, sender: &PeerId) -> Result<Option<Message>, Error> {
+        let a = &mut self.awareness;
         match msg {
             Message::Sync(msg) => match msg {
-                SyncMessage::SyncStep1(sv) => protocol.handle_sync_step1(awareness, sv),
-                SyncMessage::SyncStep2(u) => {
-                    protocol.handle_sync_step2(awareness, Update::decode_v1(&*u)?)
+                SyncMessage::SyncStep1(sv) => {
+                    let update = a.doc().transact().encode_state_as_update_v1(sv);
+                    if has_data(&*update) {
+                        Ok(Some(Message::Sync(SyncMessage::SyncStep2(update))))
+                    } else {
+                        Ok(None)
+                    }
                 }
-                SyncMessage::Update(u) => {
-                    protocol.handle_update(awareness, Update::decode_v1(&*u)?)
+                SyncMessage::SyncStep2(u) | SyncMessage::Update(u) => {
+                    let u = Update::decode_v1(&*u)?;
+                    a.doc_mut()
+                        .transact_mut_with(&*sender.to_bytes())
+                        .apply_update(u);
+                    Ok(None)
                 }
             },
-            Message::Auth(deny_reason) => protocol.handle_auth(awareness, deny_reason),
-            Message::AwarenessQuery => protocol.handle_awareness_query(awareness),
-            Message::Awareness(u) => protocol.handle_awareness_update(awareness, u),
-            Message::Custom(tag, data) => {
-                protocol.missing_handle(awareness, tag.clone(), data.clone())
+            Message::Auth(deny_reason) => {
+                if let Some(reason) = deny_reason.clone() {
+                    Err(yrs::sync::Error::PermissionDenied { reason })
+                } else {
+                    Ok(None)
+                }
             }
+            Message::AwarenessQuery => {
+                let u = a.update()?;
+                Ok(Some(Message::Awareness(u)))
+            }
+            Message::Awareness(u) => {
+                a.apply_update(u.clone())?;
+                Ok(None)
+            }
+            Message::Custom(_tag, _data) => Ok(None),
         }
         .map_err(|e| e.into())
     }
@@ -582,4 +611,8 @@ enum InternalEvent {
         updated: Vec<ClientID>,
         removed: Vec<ClientID>,
     },
+}
+#[inline]
+fn has_data(update: &[u8]) -> bool {
+    update != &[0, 0]
 }
