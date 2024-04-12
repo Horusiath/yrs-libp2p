@@ -12,11 +12,14 @@ use libp2p::{InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, StreamProtocol}
 use std::collections::hash_map::{Entry, HashMap};
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
+use std::ops::Deref;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{io, iter};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::codec::{Decoder, Framed, LengthDelimitedCodec};
+use yrs::block::ClientID;
 use yrs::encoding::read::{Cursor, Read};
 use yrs::encoding::write::Write;
 use yrs::sync::{Awareness, DefaultProtocol, Message, Protocol as _, SyncMessage};
@@ -99,44 +102,6 @@ impl Behaviour {
     #[inline]
     pub fn remove_peer(&mut self, peer_id: &PeerId) {
         self.target_peers.remove(peer_id);
-    }
-
-    /// Subscribes to a topic.
-    ///
-    /// Returns true if the subscription worked. Returns false if we were already subscribed.
-    pub fn subscribe(&mut self, topic: Topic) -> bool {
-        let h = match self.subscribed_topics.entry(topic.clone()) {
-            Entry::Occupied(_) => return false,
-            Entry::Vacant(e) => {
-                let mut options = self.config.doc_options.clone();
-                options.guid = topic.clone();
-                e.insert(TopicHandler::new(options, self.update_sender.clone()))
-            }
-        };
-        let sv = h.awareness.doc().transact().state_vector();
-
-        for peer in self.connected_peers.iter() {
-            self.events.push_back(ToSwarm::NotifyHandler {
-                peer_id: *peer,
-                handler: NotifyHandler::Any,
-                event: DocMessage {
-                    source: None,
-                    doc_name: topic.clone(),
-                    message: Message::Sync(SyncMessage::SyncStep1(sv.clone())),
-                },
-            });
-        }
-
-        true
-    }
-
-    /// Unsubscribes from a topic.
-    ///
-    /// Note that this only requires the topic name.
-    ///
-    /// Returns true if we were subscribed to this topic.
-    pub fn unsubscribe(&mut self, topic: &Topic) -> bool {
-        self.subscribed_topics.remove(topic).is_some()
     }
 
     fn broadcast(&mut self, topic: Topic, msg: Message) {
@@ -319,12 +284,34 @@ impl NetworkBehaviour for Behaviour {
                 return Poll::Ready(e);
             } else {
                 match self.update_receiver.poll_recv(cx) {
-                    Poll::Ready(Some(e)) => match e {
-                        InternalEvent::Update { topic, update } => {
-                            self.broadcast(topic, Message::Sync(SyncMessage::Update(update)));
-                            continue;
+                    Poll::Ready(Some(e)) => {
+                        match e {
+                            InternalEvent::Update { topic, update } => {
+                                self.broadcast(topic, Message::Sync(SyncMessage::Update(update)));
+                            }
+                            InternalEvent::AwarenessUpdate {
+                                topic,
+                                added,
+                                updated,
+                                removed,
+                            } => {
+                                let mut clients =
+                                    Vec::with_capacity(added.len() + updated.len() + removed.len());
+                                clients.extend_from_slice(&added);
+                                clients.extend_from_slice(&updated);
+                                clients.extend_from_slice(&removed);
+                                let awareness = self.awareness(topic.clone());
+                                match awareness.update_with_clients(clients) {
+                                    Ok(update) => {
+                                        self.broadcast(topic, Message::Awareness(update));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("failed to generate awareness update for topic `{}`: {}", topic, e);
+                                    }
+                                }
+                            }
                         }
-                    },
+                    }
                     Poll::Ready(None) | Poll::Pending => return Poll::Pending,
                 }
             }
@@ -470,18 +457,11 @@ where
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub doc_options: Options,
-
-    /// `true` if messages published by local node should be propagated as messages received from
-    /// the network, `false` by default.
-    pub subscribe_local_messages: bool,
 }
 
 impl Config {
     pub fn new(doc_options: Options) -> Self {
-        Self {
-            doc_options,
-            subscribe_local_messages: false,
-        }
+        Self { doc_options }
     }
 }
 
@@ -538,14 +518,17 @@ impl Decoder for Codec {
 struct TopicHandler {
     awareness: Awareness,
     _on_update: Subscription,
+    _on_awareness_update: Subscription,
 }
 
 impl TopicHandler {
     fn new(options: Options, mailbox: UnboundedSender<InternalEvent>) -> Self {
         let topic = options.guid.clone();
         let doc = Doc::with_options(options);
-        let on_update = doc
-            .observe_update_v1(move |_, e| {
+        let on_update = {
+            let topic = topic.clone();
+            let mailbox = mailbox.clone();
+            doc.observe_update_v1(move |_, e| {
                 // check if update has any data
                 if e.update.len() > 2 {
                     let _ = mailbox.send(InternalEvent::Update {
@@ -554,11 +537,22 @@ impl TopicHandler {
                     });
                 }
             })
-            .unwrap();
+            .unwrap()
+        };
         let awareness = Awareness::new(doc);
+        let on_awareness_update = awareness.on_update(move |e| {
+            let _ = mailbox.send(InternalEvent::AwarenessUpdate {
+                topic: topic.clone(),
+                added: e.added().into(),
+                updated: e.updated().into(),
+                removed: e.removed().into(),
+            });
+        });
+
         TopicHandler {
             awareness,
             _on_update: on_update,
+            _on_awareness_update: on_awareness_update,
         }
     }
 
@@ -588,5 +582,14 @@ impl TopicHandler {
 
 #[derive(Debug)]
 enum InternalEvent {
-    Update { topic: Topic, update: Vec<u8> },
+    Update {
+        topic: Topic,
+        update: Vec<u8>,
+    },
+    AwarenessUpdate {
+        topic: Topic,
+        added: Vec<ClientID>,
+        updated: Vec<ClientID>,
+        removed: Vec<ClientID>,
+    },
 }
