@@ -1,9 +1,8 @@
 use futures::StreamExt;
 use libp2p::mdns::tokio::Tokio;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{gossipsub, mdns, noise, swarm::SwarmEvent, tcp, yamux};
+use libp2p::{mdns, noise, swarm::SwarmEvent, tcp, yamux};
 use std::error::Error;
-use std::hash::Hash;
 use std::time::Duration;
 use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
@@ -87,13 +86,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                 },
                 SwarmEvent::Behaviour(DemoEvent::Mdns(mdns::Event::Expired(list))) => {
-                    for (peer_id, multiaddr) in list {
+                    for (peer_id, _) in list {
                         println!("mDNS discover peer has expired: {peer_id}");
                         swarm.behaviour_mut().sync.remove_peer(&peer_id);
                     }
                 },
                 SwarmEvent::Behaviour(DemoEvent::Sync(Event::Message {
-                    topic, message,source,
+                    topic,source, ..
                 })) => {
                     let doc = swarm.behaviour_mut().sync.awareness(topic.clone()).doc();
                     let map = doc.get_or_insert_map("map");

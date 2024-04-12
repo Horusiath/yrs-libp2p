@@ -12,9 +12,7 @@ use libp2p::{InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, StreamProtocol}
 use std::collections::hash_map::{Entry, HashMap};
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
-use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{io, iter};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
