@@ -1,189 +1,313 @@
-use crate::handler::{Handler, HandlerEvent, HandlerIn};
-use crate::protocol::ProtocolConfig;
-use bytes::Bytes;
-use libp2p::core::Endpoint;
+use bytes::{Bytes, BytesMut};
+use futures::{AsyncRead, AsyncWrite, SinkExt, StreamExt};
+use libp2p::core::{Endpoint, UpgradeInfo};
 use libp2p::swarm::behaviour::ConnectionEstablished;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{
     CloseConnection, ConnectionClosed, ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour,
-    NotifyHandler, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+    NotifyHandler, OneShotHandler, SubstreamProtocol, THandler, THandlerInEvent, THandlerOutEvent,
+    ToSwarm,
 };
-use libp2p::{Multiaddr, PeerId};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::error::Error;
-use std::fmt::Debug;
-use std::sync::Arc;
+use libp2p::{InboundUpgrade, Multiaddr, OutboundUpgrade, PeerId, StreamProtocol};
+use std::collections::hash_map::{Entry, HashMap};
+use std::collections::{HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::{io, iter};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use yrs::sync::{Awareness, AwarenessUpdate, DefaultProtocol, Message, Protocol, SyncMessage};
-use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::Encode;
-use yrs::{ReadTxn, Subscription, Transact, Update};
+use tokio_util::codec::{Decoder, Framed, LengthDelimitedCodec};
+use yrs::encoding::read::{Cursor, Read};
+use yrs::encoding::write::Write;
+use yrs::sync::{Awareness, DefaultProtocol, Message, Protocol as _, SyncMessage};
+use yrs::updates::decoder::{Decode, DecoderV1};
+use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+use yrs::{Doc, Options, ReadTxn, Subscription, Transact, Update};
 
-pub struct Behaviour<P> {
-    awareness: Awareness,
-    config: ProtocolConfig<P>,
-    events_rx: UnboundedReceiver<ToSwarm<Event, HandlerIn>>,
-    events_tx: UnboundedSender<ToSwarm<Event, HandlerIn>>,
-    peers: HashSet<PeerId>,
-    on_awareness_update: Subscription,
-    on_doc_update: Subscription,
+pub type Topic = std::sync::Arc<str>;
+
+pub struct Behaviour {
+    events: VecDeque<ToSwarm<Event, DocMessage>>,
+    update_receiver: UnboundedReceiver<InternalEvent>,
+    update_sender: UnboundedSender<InternalEvent>,
+    config: Config,
+    target_peers: HashSet<PeerId>,
+    connected_peers: HashSet<PeerId>,
+    subscribed_topics: HashMap<Topic, TopicHandler>,
 }
 
-impl<P> Behaviour<P>
-where
-    P: Protocol + Clone,
-{
-    pub fn new(awareness: Awareness, protocol: P) -> Self {
-        let (events_tx, events_rx) = unbounded_channel();
-        let sender = events_tx.clone();
-        let on_awareness_update = awareness.on_update(move |e| {
-            let _ = sender.send(ToSwarm::GenerateEvent(Event::AwarenessUpdate(e.clone())));
-        });
-        let sender = events_tx.clone();
-        let on_doc_update = awareness
-            .doc()
-            .observe_update_v1(move |txn, e| {
-                let _ = sender.send(ToSwarm::GenerateEvent(Event::DocUpdate(e.update.clone())));
-            })
-            .unwrap();
-        Behaviour {
-            events_rx,
-            events_tx,
-            awareness,
-            on_doc_update,
-            on_awareness_update,
-            config: ProtocolConfig::new(protocol),
-            peers: Default::default(),
+impl Behaviour {
+    /// Creates a `` with default configuration.
+    pub fn new() -> Self {
+        Self::from_config(Config::default())
+    }
+
+    /// Creates a `` with the given configuration.
+    pub fn from_config(config: Config) -> Self {
+        let (events_sender, events_receiver) = unbounded_channel();
+        Self {
+            events: VecDeque::new(),
+            update_receiver: events_receiver,
+            update_sender: events_sender,
+            config,
+            target_peers: HashSet::new(),
+            connected_peers: HashSet::new(),
+            subscribed_topics: HashMap::new(),
         }
     }
 
-    #[inline]
-    pub fn awareness(&self) -> &Awareness {
-        &self.awareness
+    pub fn awareness(&mut self, topic: Topic) -> &mut Awareness {
+        match self.subscribed_topics.entry(topic.clone()) {
+            Entry::Vacant(e) => {
+                let mut options = Options::default();
+                options.guid = topic;
+                &mut e
+                    .insert(TopicHandler::new(options, self.update_sender.clone()))
+                    .awareness
+            }
+            Entry::Occupied(e) => &mut e.into_mut().awareness,
+        }
     }
 
+    /// Add a node to the list of nodes to propagate messages to.
     #[inline]
-    pub fn awareness_mut(&mut self) -> &mut Awareness {
-        &mut self.awareness
-    }
-
     pub fn add_peer(&mut self, peer_id: PeerId) {
-        if self.peers.insert(peer_id) {
-            let state_vector = self.awareness.doc().transact().state_vector();
-            self.send_message(peer_id, Message::Sync(SyncMessage::SyncStep1(state_vector)));
+        // Send our initial message
+        if self.connected_peers.contains(&peer_id) {
+            for (topic, handle) in self.subscribed_topics.iter() {
+                let sv = handle.awareness.doc().transact().state_vector();
+                self.events.push_back(ToSwarm::NotifyHandler {
+                    peer_id,
+                    handler: NotifyHandler::Any,
+                    event: DocMessage {
+                        source: None,
+                        doc_name: topic.clone(),
+                        message: Message::Sync(SyncMessage::SyncStep1(sv)),
+                    },
+                });
+            }
+        }
+
+        if self.target_peers.insert(peer_id) {
+            self.events.push_back(ToSwarm::Dial {
+                opts: DialOpts::peer_id(peer_id).build(),
+            });
         }
     }
 
-    pub fn remove_peer(&mut self, peer_id: PeerId) {
-        if self.peers.remove(&peer_id) {
-            todo!()
+    /// Remove a node from the list of nodes to propagate messages to.
+    #[inline]
+    pub fn remove_peer(&mut self, peer_id: &PeerId) {
+        self.target_peers.remove(peer_id);
+    }
+
+    /// Subscribes to a topic.
+    ///
+    /// Returns true if the subscription worked. Returns false if we were already subscribed.
+    pub fn subscribe(&mut self, topic: Topic) -> bool {
+        let h = match self.subscribed_topics.entry(topic.clone()) {
+            Entry::Occupied(_) => return false,
+            Entry::Vacant(e) => {
+                let mut options = self.config.doc_options.clone();
+                options.guid = topic.clone();
+                e.insert(TopicHandler::new(options, self.update_sender.clone()))
+            }
+        };
+        let sv = h.awareness.doc().transact().state_vector();
+
+        for peer in self.connected_peers.iter() {
+            self.events.push_back(ToSwarm::NotifyHandler {
+                peer_id: *peer,
+                handler: NotifyHandler::Any,
+                event: DocMessage {
+                    source: None,
+                    doc_name: topic.clone(),
+                    message: Message::Sync(SyncMessage::SyncStep1(sv.clone())),
+                },
+            });
+        }
+
+        true
+    }
+
+    /// Unsubscribes from a topic.
+    ///
+    /// Note that this only requires the topic name.
+    ///
+    /// Returns true if we were subscribed to this topic.
+    pub fn unsubscribe(&mut self, topic: &Topic) -> bool {
+        self.subscribed_topics.remove(topic).is_some()
+    }
+
+    fn broadcast(&mut self, topic: Topic, msg: Message) {
+        for &peer_id in self.connected_peers.iter() {
+            self.events.push_back(ToSwarm::NotifyHandler {
+                peer_id,
+                handler: NotifyHandler::Any,
+                event: DocMessage {
+                    doc_name: topic.clone(),
+                    message: msg.clone(),
+                    source: None,
+                },
+            })
         }
     }
 
-    fn on_connection_closed(&mut self, peer_id: PeerId, remaining_connections: usize) {
-        if remaining_connections > 0 {
-            return; // only disconnect when all are disconnected
+    fn on_connection_established(
+        &mut self,
+        ConnectionEstablished {
+            peer_id,
+            other_established,
+            ..
+        }: ConnectionEstablished,
+    ) {
+        if other_established > 0 {
+            // We only care about the first time a peer connects.
+            return;
         }
-        self.remove_peer(peer_id);
+
+        // We need to send our subscriptions to the newly-connected node.
+        if self.target_peers.contains(&peer_id) {
+            for (topic, handle) in self.subscribed_topics.iter() {
+                let sv = handle.awareness.doc().transact().state_vector();
+                self.events.push_back(ToSwarm::NotifyHandler {
+                    peer_id,
+                    handler: NotifyHandler::Any,
+                    event: DocMessage {
+                        source: None,
+                        doc_name: topic.clone(),
+                        message: Message::Sync(SyncMessage::SyncStep1(sv)),
+                    },
+                });
+            }
+        }
+
+        self.connected_peers.insert(peer_id);
     }
 
-    fn on_connection_established(&mut self, peer_id: PeerId, other_connections: usize) {
-        if other_connections > 0 {
-            return; // only connect to first one
+    fn on_connection_closed(
+        &mut self,
+        ConnectionClosed {
+            peer_id,
+            remaining_established,
+            ..
+        }: ConnectionClosed,
+    ) {
+        if remaining_established > 0 {
+            // we only care about peer disconnections
+            return;
         }
-        self.add_peer(peer_id);
+
+        let was_in = self.connected_peers.remove(&peer_id);
+        debug_assert!(was_in);
+
+        // We can be disconnected by the remote in case of inactivity for example, so we always
+        // try to reconnect.
+        if self.target_peers.contains(&peer_id) {
+            self.events.push_back(ToSwarm::Dial {
+                opts: DialOpts::peer_id(peer_id).build(),
+            });
+        }
     }
 
-    fn handle(&mut self, message: Message, sender: PeerId) {
-        match handle_message(&self.config.protocol, &mut self.awareness, message) {
+    fn handle_message(&mut self, msg: DocMessage, sender: PeerId) {
+        if msg.source.is_none() {
+            // ignore messages generated locally
+            return;
+        }
+
+        self.events
+            .push_back(ToSwarm::GenerateEvent(Event::Message {
+                source: msg.source.clone(),
+                topic: msg.doc_name.clone(),
+                message: msg.message.clone(),
+            }));
+
+        let handle = match self.subscribed_topics.entry(msg.doc_name.clone()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let mut options = self.config.doc_options.clone();
+                options.guid = msg.doc_name.clone();
+                e.insert(TopicHandler::new(options, self.update_sender.clone()))
+            }
+        };
+        match handle.handle(msg.message) {
             Ok(None) => { /* do nothing */ }
-            Ok(Some(reply)) => self.send_message(sender, reply),
-            Err(error) => {
-                tracing::error!("error while handling incoming message from {sender}: {error}")
+            Ok(Some(reply)) => {
+                self.events.push_back(ToSwarm::NotifyHandler {
+                    peer_id: sender,
+                    handler: NotifyHandler::Any,
+                    event: DocMessage {
+                        source: None,
+                        doc_name: msg.doc_name,
+                        message: reply.into(),
+                    },
+                });
+            }
+            Err(e) => {
+                tracing::warn!("failed to handle message from {sender}: {e}")
             }
         }
     }
-
-    fn send_message(&self, peer_id: PeerId, message: Message) {
-        let data = Bytes::from(message.encode_v1());
-        let _ = self.events_tx.send(ToSwarm::NotifyHandler {
-            peer_id,
-            handler: NotifyHandler::Any,
-            event: HandlerIn::Send(data),
-        });
-    }
 }
 
-impl Default for Behaviour<DefaultProtocol> {
-    fn default() -> Self {
-        Self::new(Awareness::default(), DefaultProtocol)
-    }
-}
-
-impl<P> NetworkBehaviour for Behaviour<P>
-where
-    P: Protocol + Debug + Clone + Send + 'static,
-{
-    type ConnectionHandler = Handler<P>;
+impl NetworkBehaviour for Behaviour {
+    type ConnectionHandler = OneShotHandler<Protocol, DocMessage, InnerMessage>;
     type ToSwarm = Event;
 
     fn handle_established_inbound_connection(
         &mut self,
-        connection_id: ConnectionId,
-        peer: PeerId,
-        local_addr: &Multiaddr,
-        remote_addr: &Multiaddr,
+        _: ConnectionId,
+        peer_id: PeerId,
+        _: &Multiaddr,
+        _: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        tracing::trace!("established inbound connection {connection_id} to peer {peer}");
-        Handler::new(connection_id, peer, self.config.clone())
+        let listen_protocol = SubstreamProtocol::new(Protocol::new(peer_id), Default::default());
+        Ok(OneShotHandler::new(listen_protocol, Default::default()))
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        connection_id: ConnectionId,
-        peer: PeerId,
-        addr: &Multiaddr,
-        role_override: Endpoint,
+        _: ConnectionId,
+        peer_id: PeerId,
+        _: &Multiaddr,
+        _: Endpoint,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        tracing::trace!("established outbound connection {connection_id} to peer {peer}");
-        Handler::new(connection_id, peer, self.config.clone())
+        let listen_protocol = SubstreamProtocol::new(Protocol::new(peer_id), Default::default());
+        Ok(OneShotHandler::new(listen_protocol, Default::default()))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
-        tracing::trace!("swarm event: {event:?}");
         match event {
-            FromSwarm::ConnectionEstablished(e) => {
-                self.on_connection_established(e.peer_id, e.other_established)
+            FromSwarm::ConnectionEstablished(connection_established) => {
+                self.on_connection_established(connection_established)
             }
-            FromSwarm::ConnectionClosed(e) => {
-                self.on_connection_closed(e.peer_id, e.remaining_established)
+            FromSwarm::ConnectionClosed(connection_closed) => {
+                self.on_connection_closed(connection_closed)
             }
-            FromSwarm::AddressChange(change) => {}
-            FromSwarm::DialFailure(fail) => {}
-            FromSwarm::ListenFailure(fail) => {}
-            FromSwarm::NewListener(listener) => {}
-            FromSwarm::NewListenAddr(addr) => {}
-            FromSwarm::ExpiredListenAddr(addr) => {}
-            FromSwarm::ListenerError(err) => {}
-            FromSwarm::ListenerClosed(closed) => {}
-            FromSwarm::NewExternalAddrCandidate(candidate) => {}
-            FromSwarm::ExternalAddrConfirmed(confirmed) => {}
-            FromSwarm::ExternalAddrExpired(expired) => {}
             _ => {}
         }
     }
 
     fn on_connection_handler_event(
         &mut self,
-        peer_id: PeerId,
+        propagation_source: PeerId,
         connection_id: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
-        tracing::trace!("connection handler event: {event:?}");
+        // We ignore successful sends or timeouts.
         match event {
-            HandlerEvent::Received(message) => self.handle(message, peer_id),
-        }
+            Ok(InnerMessage::Rx(msg)) => self.handle_message(msg, propagation_source),
+            Ok(InnerMessage::Sent) => return,
+            Err(e) => {
+                tracing::warn!("Failed to send message: {e}");
+                self.events.push_back(ToSwarm::CloseConnection {
+                    peer_id: propagation_source,
+                    connection: CloseConnection::One(connection_id),
+                });
+                return;
+            }
+        };
     }
 
     fn poll(
@@ -191,80 +315,278 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         loop {
-            match self.events_rx.poll_recv(cx) {
-                Poll::Ready(Some(msg)) => match msg {
-                    ToSwarm::GenerateEvent(Event::DocUpdate(update)) => {
-                        let msg: Bytes = Message::Sync(SyncMessage::Update(update))
-                            .encode_v1()
-                            .into();
-                        for &peer_id in self.peers.iter() {
-                            let _ = self.events_tx.send(ToSwarm::NotifyHandler {
-                                peer_id,
-                                handler: NotifyHandler::Any,
-                                event: HandlerIn::Send(msg.clone()),
-                            });
+            if let Some(e) = self.events.pop_front() {
+                return Poll::Ready(e);
+            } else {
+                match self.update_receiver.poll_recv(cx) {
+                    Poll::Ready(Some(e)) => match e {
+                        InternalEvent::Update { topic, update } => {
+                            self.broadcast(topic, Message::Sync(SyncMessage::Update(update)));
+                            continue;
                         }
-                    }
-                    ToSwarm::GenerateEvent(Event::AwarenessUpdate(e)) => {
-                        let mut clients = Vec::with_capacity(
-                            e.added().len() + e.updated().len() + e.removed().len(),
-                        );
-                        clients.extend_from_slice(e.added());
-                        clients.extend_from_slice(e.updated());
-                        clients.extend_from_slice(e.removed());
-                        match self.awareness.update_with_clients(clients) {
-                            Ok(update) => {
-                                let msg: Bytes = Message::Awareness(update).encode_v1().into();
-                                for &peer_id in self.peers.iter() {
-                                    let _ = self.events_tx.send(ToSwarm::NotifyHandler {
-                                        peer_id,
-                                        handler: NotifyHandler::Any,
-                                        event: HandlerIn::Send(msg.clone()),
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("failed to broadcast awareness update: {e}");
-                            }
-                        }
-                    }
-                    other => return Poll::Ready(other),
-                },
-                Poll::Ready(None) => return Poll::Pending,
-                Poll::Pending => return Poll::Pending,
+                    },
+                    Poll::Ready(None) | Poll::Pending => return Poll::Pending,
+                }
             }
         }
     }
 }
 
+/// Transmission between the `OneShotHandler` and the `Handler`.
 #[derive(Debug)]
-pub enum Event {
-    Message { sender: PeerId, message: Message },
-    DocUpdate(Vec<u8>),
-    AwarenessUpdate(yrs::sync::awareness::Event),
+pub enum InnerMessage {
+    /// We received an RPC from a remote.
+    Rx(DocMessage),
+    /// We successfully sent an RPC request.
+    Sent,
 }
 
-fn handle_message<P: Protocol>(
-    protocol: &P,
-    awareness: &mut Awareness,
-    msg: Message,
-) -> Result<Option<Message>, Box<dyn std::error::Error>> {
-    match msg {
-        Message::Sync(sync_msg) => match sync_msg {
-            SyncMessage::SyncStep1(state_vector) => {
-                protocol.handle_sync_step1(awareness, state_vector)
-            }
-            SyncMessage::SyncStep2(update) => {
-                protocol.handle_sync_step2(awareness, Update::decode_v1(&*update)?)
-            }
-            SyncMessage::Update(update) => {
-                protocol.handle_sync_step2(awareness, Update::decode_v1(&*update)?)
-            }
-        },
-        Message::Auth(deny_reason) => protocol.handle_auth(awareness, deny_reason),
-        Message::AwarenessQuery => protocol.handle_awareness_query(awareness),
-        Message::Awareness(update) => protocol.handle_awareness_update(awareness, update),
-        Message::Custom(tag, data) => protocol.missing_handle(awareness, tag, data),
+impl From<DocMessage> for InnerMessage {
+    #[inline]
+    fn from(rpc: DocMessage) -> InnerMessage {
+        InnerMessage::Rx(rpc)
     }
-    .map_err(|e| e.into())
+}
+
+impl From<()> for InnerMessage {
+    #[inline]
+    fn from(_: ()) -> InnerMessage {
+        InnerMessage::Sent
+    }
+}
+
+/// Event that can happen on the floodsub behaviour.
+#[derive(Debug)]
+pub enum Event {
+    /// A message has been received.
+    Message {
+        topic: Topic,
+        message: Message,
+        source: Option<PeerId>,
+    },
+}
+
+const PROTOCOL_NAME: StreamProtocol = StreamProtocol::new("/ysync/1.0.0");
+
+/// Implementation of `ConnectionUpgrade` for the floodsub protocol.
+#[derive(Debug, Clone)]
+pub struct Protocol {
+    peer_id: PeerId,
+}
+
+impl Protocol {
+    /// Builds a new `Protocol`.
+    pub fn new(peer_id: PeerId) -> Protocol {
+        Protocol { peer_id }
+    }
+}
+
+impl UpgradeInfo for Protocol {
+    type Info = StreamProtocol;
+    type InfoIter = iter::Once<Self::Info>;
+
+    fn protocol_info(&self) -> Self::InfoIter {
+        iter::once(PROTOCOL_NAME)
+    }
+}
+
+impl<TSocket> InboundUpgrade<TSocket> for Protocol
+where
+    TSocket: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    type Output = DocMessage;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+
+    fn upgrade_inbound(self, socket: TSocket, _: Self::Info) -> Self::Future {
+        use tokio_util::compat::FuturesAsyncReadCompatExt;
+        let peer_id = self.peer_id.clone();
+        Box::pin(async move {
+            let mut framed = Framed::new(socket.compat(), Codec::new(Some(peer_id)));
+
+            let msg = framed
+                .next()
+                .await
+                .ok_or_else(|| Error::ReadError(io::ErrorKind::UnexpectedEof.into()))??;
+
+            Ok(msg)
+        })
+    }
+}
+
+/// Reach attempt interrupt errors.
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    /// Error when reading the packet from the socket.
+    #[error("Failed to read from socket: {0}")]
+    ReadError(#[from] io::Error),
+    #[error("Failed to decode message: {0}")]
+    DecodeError(#[from] yrs::encoding::read::Error),
+    #[error("failed to sync message: {0}")]
+    SyncError(#[from] yrs::sync::Error),
+}
+
+/// An RPC received by the floodsub system.
+#[derive(Debug, Clone)]
+pub struct DocMessage {
+    /// Name of the document, this message is related to.
+    pub doc_name: Topic,
+    /// Message content.
+    pub message: Message,
+    /// Has this message been generated by the current peer.
+    pub source: Option<PeerId>,
+}
+
+impl UpgradeInfo for DocMessage {
+    type Info = StreamProtocol;
+    type InfoIter = iter::Once<Self::Info>;
+
+    fn protocol_info(&self) -> Self::InfoIter {
+        iter::once(PROTOCOL_NAME)
+    }
+}
+
+impl<TSocket> OutboundUpgrade<TSocket> for DocMessage
+where
+    TSocket: AsyncWrite + AsyncRead + Send + Unpin + 'static,
+{
+    type Output = ();
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+
+    fn upgrade_outbound(self, socket: TSocket, _: Self::Info) -> Self::Future {
+        use tokio_util::compat::FuturesAsyncReadCompatExt;
+        Box::pin(async move {
+            tracing::trace!("sending message {self:?}");
+            let mut framed = Framed::new(socket.compat(), Codec::new(None));
+            framed.send(self).await?;
+            framed.close().await?;
+            Ok(())
+        })
+    }
+}
+
+/// Configuration options for the  protocol.
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    pub doc_options: Options,
+
+    /// `true` if messages published by local node should be propagated as messages received from
+    /// the network, `false` by default.
+    pub subscribe_local_messages: bool,
+}
+
+impl Config {
+    pub fn new(doc_options: Options) -> Self {
+        Self {
+            doc_options,
+            subscribe_local_messages: false,
+        }
+    }
+}
+
+struct Codec {
+    peer_id: Option<PeerId>,
+    inner: LengthDelimitedCodec,
+}
+
+impl Codec {
+    fn new(peer_id: Option<PeerId>) -> Self {
+        Codec {
+            peer_id,
+            inner: LengthDelimitedCodec::new(),
+        }
+    }
+}
+
+impl tokio_util::codec::Encoder<DocMessage> for Codec {
+    type Error = Error;
+
+    fn encode(&mut self, item: DocMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let mut encoder = EncoderV1::new();
+        encoder.write_string(&*item.doc_name);
+        item.message.encode(&mut encoder);
+        self.inner.encode(Bytes::from(encoder.to_vec()), dst)?;
+        Ok(())
+    }
+}
+
+impl Decoder for Codec {
+    type Item = DocMessage;
+    type Error = Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match self.inner.decode(src) {
+            Ok(Some(data)) => {
+                let mut decoder = DecoderV1::new(Cursor::new(data.as_ref()));
+                let topic: Topic = decoder.read_string()?.into();
+                let message = Message::decode(&mut decoder)?;
+                let message = DocMessage {
+                    source: self.peer_id,
+                    doc_name: topic,
+                    message,
+                };
+                tracing::trace!("received message {message:?}");
+                Ok(Some(message))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+struct TopicHandler {
+    awareness: Awareness,
+    _on_update: Subscription,
+}
+
+impl TopicHandler {
+    fn new(options: Options, mailbox: UnboundedSender<InternalEvent>) -> Self {
+        let topic = options.guid.clone();
+        let doc = Doc::with_options(options);
+        let on_update = doc
+            .observe_update_v1(move |_, e| {
+                // check if update has any data
+                if e.update.len() > 2 {
+                    let _ = mailbox.send(InternalEvent::Update {
+                        topic: topic.clone(),
+                        update: e.update.clone(),
+                    });
+                }
+            })
+            .unwrap();
+        let awareness = Awareness::new(doc);
+        TopicHandler {
+            awareness,
+            _on_update: on_update,
+        }
+    }
+
+    fn handle(&mut self, msg: Message) -> Result<Option<Message>, Error> {
+        let protocol = DefaultProtocol;
+        let awareness = &mut self.awareness;
+        match msg {
+            Message::Sync(msg) => match msg {
+                SyncMessage::SyncStep1(sv) => protocol.handle_sync_step1(awareness, sv),
+                SyncMessage::SyncStep2(u) => {
+                    protocol.handle_sync_step2(awareness, Update::decode_v1(&*u)?)
+                }
+                SyncMessage::Update(u) => {
+                    protocol.handle_update(awareness, Update::decode_v1(&*u)?)
+                }
+            },
+            Message::Auth(deny_reason) => protocol.handle_auth(awareness, deny_reason),
+            Message::AwarenessQuery => protocol.handle_awareness_query(awareness),
+            Message::Awareness(u) => protocol.handle_awareness_update(awareness, u),
+            Message::Custom(tag, data) => {
+                protocol.missing_handle(awareness, tag.clone(), data.clone())
+            }
+        }
+        .map_err(|e| e.into())
+    }
+}
+
+#[derive(Debug)]
+enum InternalEvent {
+    Update { topic: Topic, update: Vec<u8> },
 }

@@ -2,20 +2,18 @@ use futures::StreamExt;
 use libp2p::mdns::tokio::Tokio;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{gossipsub, mdns, noise, swarm::SwarmEvent, tcp, yamux};
-use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::time::Duration;
 use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
-use yrs::sync::DefaultProtocol;
 use yrs::types::ToJson;
 use yrs::{Map, Transact};
-use yrs_libp2p::behaviour::Behaviour;
+use yrs_libp2p::behaviour::{Behaviour, Event, Topic};
 
 #[derive(NetworkBehaviour)]
 struct Demo {
-    sync: Behaviour<DefaultProtocol>,
+    sync: Behaviour,
     mdns: libp2p::mdns::Behaviour<Tokio>,
 }
 
@@ -34,14 +32,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )?
         .with_quic()
         .with_behaviour(|key| {
-            // To content-address message, we can take the hash of message and use it as an ID.
-            let message_id_fn = |message: &gossipsub::Message| {
-                let mut s = DefaultHasher::new();
-                message.data.hash(&mut s);
-                gossipsub::MessageId::from(s.finish().to_string())
-            };
-
-            let sync = Behaviour::default();
+            // build a gossipsub network behaviour
+            let sync = Behaviour::new();
 
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
@@ -56,15 +48,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Listen on all interfaces and whatever port the OS assigns
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
+    let topic: Topic = "test-doc".into();
+
     println!("Enter command via STDIN");
 
-    // Kick it off
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
+                /* Accepted commands:
+                    - `set {key} {value}`
+                    - `del {key}`
+                */
                 match Args::from_str(line.as_str()) {
                     Some(args) => {
-                        let doc = swarm.behaviour_mut().sync.awareness_mut().doc();
+                        let doc = swarm.behaviour_mut().sync.awareness(topic.clone()).doc();
                         let map = doc.get_or_insert_map("map");
                         let mut txn = doc.transact_mut();
 
@@ -76,7 +73,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 map.remove(&mut txn, key);
                             }
                         }
-                        println!("Document state (local change): {}", map.to_json(&txn))
                     },
                     None => {
                         eprintln!("PARSE ERROR");
@@ -93,16 +89,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 SwarmEvent::Behaviour(DemoEvent::Mdns(mdns::Event::Expired(list))) => {
                     for (peer_id, multiaddr) in list {
                         println!("mDNS discover peer has expired: {peer_id}");
-                        swarm.behaviour_mut().sync.remove_peer(peer_id);
+                        swarm.behaviour_mut().sync.remove_peer(&peer_id);
                     }
                 },
-                SwarmEvent::Behaviour(DemoEvent::Sync(yrs_libp2p::behaviour::Event::Message {
-                    sender,
-                    message
+                SwarmEvent::Behaviour(DemoEvent::Sync(Event::Message {
+                    topic, message,source,
                 })) => {
-                    let doc = swarm.behaviour().sync.awareness().doc();
+                    let doc = swarm.behaviour_mut().sync.awareness(topic.clone()).doc();
                     let map = doc.get_or_insert_map("map");
-                    println!("Document state (remote change): {}", map.to_json(&doc.transact()))
+                    let source = match source {
+                        None => "local".to_string(),
+                        Some(peer_id) => format!("`{peer_id}`")};
+                    println!("Document `{}` state (from {}): {}", topic, source, map.to_json(&doc.transact()))
                 },
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("Local node is listening on {address}");
@@ -111,6 +109,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         }
     }
+    // Kick it off
 }
 
 enum Args<'a> {
@@ -120,28 +119,19 @@ enum Args<'a> {
 
 impl<'a> Args<'a> {
     fn from_str(s: &'a str) -> Option<Self> {
-        if s.starts_with("SET") {
-            let mut splits = s.strip_prefix("SET")?.split('=');
-            if let Some(key) = splits.next() {
-                let key = key.strip_prefix(' ')?.strip_suffix(' ')?;
-                if let Some(value) = splits.next() {
-                    let value = value.strip_prefix(' ')?.strip_suffix(' ')?;
-                    Some(Args::Set { key, value })
-                } else {
-                    None
-                }
-            } else {
-                None
+        let mut s = s.split(' ');
+        let cmd = s.next()?;
+        match cmd {
+            "set" => {
+                let key = s.next()?;
+                let value = s.next()?;
+                Some(Args::Set { key, value })
             }
-        } else if s.starts_with("DEL") {
-            let s = s.strip_prefix("DEL")?.strip_prefix(' ')?.strip_suffix(' ');
-            if let Some(key) = s {
+            "del" => {
+                let key = s.next()?;
                 Some(Args::Remove { key })
-            } else {
-                None
             }
-        } else {
-            None
+            _ => None,
         }
     }
 }
