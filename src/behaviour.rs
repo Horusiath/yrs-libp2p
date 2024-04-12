@@ -57,17 +57,35 @@ impl Behaviour {
         }
     }
 
-    pub fn awareness(&mut self, topic: Topic) -> &mut Awareness {
+    fn handler(&mut self, topic: Topic) -> &mut TopicHandler {
         match self.subscribed_topics.entry(topic.clone()) {
             Entry::Vacant(e) => {
                 let mut options = Options::default();
-                options.guid = topic;
-                &mut e
-                    .insert(TopicHandler::new(options, self.update_sender.clone()))
-                    .awareness
+                options.guid = topic.clone();
+                let handler = e.insert(TopicHandler::new(options, self.update_sender.clone()));
+
+                let sv = handler.awareness.doc().transact().state_vector();
+                // this awareness might not yet exist locally, but other peers may already have some state in it
+                for &peer_id in self.connected_peers.iter() {
+                    self.events.push_back(ToSwarm::NotifyHandler {
+                        peer_id,
+                        handler: NotifyHandler::Any,
+                        event: DocMessage {
+                            source: None,
+                            doc_name: topic.clone(),
+                            message: Message::Sync(SyncMessage::SyncStep1(sv.clone())),
+                        },
+                    });
+                }
+
+                handler
             }
-            Entry::Occupied(e) => &mut e.into_mut().awareness,
+            Entry::Occupied(e) => e.into_mut(),
         }
+    }
+
+    pub fn awareness(&mut self, topic: Topic) -> &mut Awareness {
+        &mut self.handler(topic).awareness
     }
 
     /// Add a node to the list of nodes to propagate messages to.
@@ -167,14 +185,7 @@ impl Behaviour {
                 message: msg.message.clone(),
             }));
 
-        let handle = match self.subscribed_topics.entry(msg.doc_name.clone()) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => {
-                let mut options = self.config.doc_options.clone();
-                options.guid = msg.doc_name.clone();
-                e.insert(TopicHandler::new(options, self.update_sender.clone()))
-            }
-        };
+        let handle = self.handler(msg.doc_name.clone());
         match handle.handle(msg.message) {
             Ok(None) => { /* do nothing */ }
             Ok(Some(reply)) => {
